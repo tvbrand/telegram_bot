@@ -1,0 +1,362 @@
+для бота # -*- coding: utf-8 -*-
+"""
+Telegram-бот с одноразовой авторизацией и форматированием ответа:
+- Первый, кто пришлёт правильный пароль (/auth ПАРОЛЬ), становится владельцем (сохраняем user_id в owner.json)
+- Дальше отвечает только владельцу (остальным пишет про авторизацию)
+- Любой может прислать /myid, чтобы увидеть свой user_id и chat_id
+- На любое текстовое сообщение владельца: отправляем в OpenRouter без system-промтов и возвращаем ответ
+- Перед отправкой в Telegram:
+    * нормализуем markdown-пуллитов/жирного/курсива → обычный текст с «•»
+    * аккуратно форматируем телефонные номера (E.123-подобно), не трогаем ссылки
+- Plain text (без HTML/Markdown), чтобы Телега ничего не парсила сама
+
+Переменные окружения:
+  TELEGRAM_BOT_TOKEN, OPENROUTER_API_KEY, BOT_PASSWORD (обязательно), OWNER_PATH (необязательно)
+"""
+
+import os
+import re
+import time
+import json
+import requests
+
+# ========= Настройки =========
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8426472430:AAEp2q9b3d2TcL6Zwym-ry6elAfsZmv8Cfk")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "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")
+BOT_PASSWORD       = os.getenv("BOT_PASSWORD", "Стартуем")  # задай свой!
+
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL_CANDIDATES = [
+    "google/gemma-3n-e2b-it:free",
+    "qwen/qwen2.5-7b-instruct:free",
+    "meta-llama/llama-3.1-8b-instruct:free",
+    "mistralai/mistral-7b-instruct:free",
+]
+
+OWNER_PATH = os.getenv("OWNER_PATH", "owner.json")
+TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+# ========= Владелец =========
+def load_owner_id():
+    try:
+        with open(OWNER_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return int(data.get("owner_id"))
+    except Exception:
+        return None
+
+def save_owner_id(owner_id: int):
+    with open(OWNER_PATH, "w", encoding="utf-8") as f:
+        json.dump({"owner_id": int(owner_id)}, f)
+
+OWNER_ID = load_owner_id()
+
+# ========= Telegram утилиты =========
+def tg_send_action(chat_id: int, action: str = "typing"):
+    try:
+        requests.post(f"{TG_API}/sendChatAction", json={"chat_id": chat_id, "action": action}, timeout=10)
+    except Exception:
+        pass
+
+def tg_send_message(chat_id: int, text: str):
+    r = requests.post(f"{TG_API}/sendMessage", json={
+        "chat_id": chat_id,
+        "text": text or "",
+        "disable_web_page_preview": True
+    }, timeout=30)
+    try:
+        j = r.json()
+    except Exception:
+        j = {"ok": False, "raw": r.text}
+    if not j.get("ok"):
+        print("[TG SEND ERR]", j)
+    return j
+
+def chunk_text(text: str, max_len: int = 3800):
+    lines = (text or "").splitlines(True)
+    chunks, buf, total = [], [], 0
+    for line in lines:
+        if total + len(line) > max_len and buf:
+            chunks.append("".join(buf)); buf, total = [line], len(line)
+        else:
+            buf.append(line); total += len(line)
+    if buf:
+        chunks.append("".join(buf))
+    return chunks
+
+# ========= Нормализация ответа (безопасно для телефонов/URL) =========
+URL_RE = re.compile(r'(https?://[^\s]+)', re.I)
+
+def _protect_urls(text: str):
+    """Замещаем URL плейсхолдерами, чтобы не портить их в пост-обработке."""
+    urls = []
+    def repl(m):
+        urls.append(m.group(0))
+        return f"__URL{len(urls)-1}__"
+    safe = URL_RE.sub(repl, text)
+    return safe, urls
+
+def _restore_urls(text: str, urls):
+    for i, u in enumerate(urls):
+        text = text.replace(f"__URL{i}__", u)
+    return text
+
+def normalize_plain(text: str) -> str:
+    """
+    Убираем markdown-оформление, оставляя читабельный текст:
+      * и - в начале строки → •
+      **жирный**, __жирный__, *курсив* → просто текст
+      заголовки # → обычные строки
+      бэктики → удаляем
+    URL заранее защищаем/восстанавливаем, чтобы не задеть.
+    """
+    if not text:
+        return ""
+    t = text.replace("\r\n", "\n")
+
+    # защитить URL
+    t, urls = _protect_urls(t)
+
+    # маркеры списков → •
+    t = re.sub(r'^\s*[*-]\s+', '• ', t, flags=re.M)
+
+    # жир/курсив markdown
+    t = re.sub(r'\*\*(.*?)\*\*', r'\1', t)      # **..**
+    t = re.sub(r'__(.*?)__', r'\1', t)          # __..__
+    # одиночные *..* (не **..**)
+    t = re.sub(r'(?<!\*)\*(?!\*)([^*\n]+?)(?<!\*)\*(?!\*)', r'\1', t)
+
+    # заголовки "#", "##" и т.п. → просто текст
+    t = re.sub(r'^\s{0,3}#{1,6}\s*', '', t, flags=re.M)
+
+    # тройные/одинарные бэктики
+    t = re.sub(r'```(.*?)```', r'\1', t, flags=re.S)
+    t = t.replace('`', '')
+
+    # лишние пустые строки
+    t = re.sub(r'\n{3,}', '\n\n', t).strip()
+
+    # восстановить URL
+    t = _restore_urls(t, urls)
+    return t
+
+# Телефоны: распознаём +CCC c цифрами, мягко форматируем (не трогаем URL и короткие номера типа 112)
+PHONE_CANDIDATE = re.compile(r'(?<!\w)(\+\s*\d[\d\-\s\(\)]{7,20}\d)(?!\w)')
+
+def _digits_only(s: str) -> str:
+    return ''.join(ch for ch in s if ch.isdigit())
+
+def _fmt_groups(digs: str, groups) -> str:
+    pos = 0
+    out = []
+    for g in groups:
+        if pos >= len(digs): break
+        out.append(digs[pos:pos+g])
+        pos += g
+    if pos < len(digs):
+        out.append(digs[pos:])
+    return " ".join(out)
+
+def format_phones(text: str) -> str:
+    if not text:
+        return text
+
+    # защитить URL
+    safe, urls = _protect_urls(text)
+
+    def repl(m):
+        raw = m.group(1)
+        s = raw.replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
+        if not s.startswith('+'):
+            return raw  # не трогаем
+        digs = _digits_only(s)
+        if len(digs) < 8 or len(digs) > 16:
+            return raw  # подозрительно, не форматируем
+
+        # страна + остальное
+        # известные паттерны
+        if digs.startswith('420') and len(digs) == 12:  # +420 + 9
+            cc, rest = '+420', digs[3:]
+            return f"{cc} {_fmt_groups(rest, [3,3,3])}"
+        if digs.startswith('48') and len(digs) == 11:   # +48 + 9
+            cc, rest = '+48', digs[2:]
+            return f"{cc} {_fmt_groups(rest, [3,3,3])}"
+        if digs.startswith('7') and len(digs) == 11:    # +7 + 10
+            cc, rest = '+7', digs[1:]
+            return f"{cc} {_fmt_groups(rest, [3,3,2,2])}"
+        if digs.startswith('380') and len(digs) == 12:  # +380 + 9
+            cc, rest = '+380', digs[3:]
+            return f"{cc} {_fmt_groups(rest, [2,3,2,2])}"
+
+        # общее правило: считаем код страны = 3 если доступно, иначе 2/1; остальное по 3 с конца
+        # попроще: оставим как есть, но вставим пробелы каждые 3 с конца
+        # вырезаем плюс и весь номер, группируем с конца
+        cc_len = 1
+        if digs.startswith('1'):
+            cc_len = 1
+        elif len(digs) >= 11:
+            cc_len = 3
+        elif len(digs) >= 10:
+            cc_len = 2
+        cc = '+' + digs[:cc_len]
+        rest = digs[cc_len:]
+
+        groups = []
+        # группируем rest с конца тройками
+        while len(rest) > 3:
+            groups.insert(0, rest[-3:])
+            rest = rest[:-3]
+        if rest:
+            groups.insert(0, rest)
+        return f"{cc} {' '.join(groups)}"
+
+    safe = PHONE_CANDIDATE.sub(repl, safe)
+    return _restore_urls(safe, urls)
+
+def postprocess_answer(text: str) -> str:
+    # 1) убрать markdown-оформление → plain с «•»
+    t = normalize_plain(text)
+    # 2) аккуратно отформатировать телефоны
+    t = format_phones(t)
+    return t
+
+# ========= OpenRouter =========
+def or_chat_user_only(model: str, user_text: str, temperature=0.6, top_p=0.9, timeout=120) -> str:
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://deepnote.com",
+        "X-Title": "Gorodskoj Assistant",
+    }
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": user_text}],
+        "temperature": temperature,
+        "top_p": top_p
+    }
+    resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=timeout)
+    if resp.status_code != 200:
+        try:
+            raise RuntimeError(f"HTTP {resp.status_code}: {resp.json()}")
+        except Exception:
+            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:1000]}")
+    data = resp.json()
+    if not data.get("choices"):
+        raise RuntimeError(f"Bad response: {json.dumps(data)[:800]}")
+    return data["choices"][0]["message"]["content"]
+
+def ask_openrouter_plain(user_text: str) -> str:
+    last_err = None
+    for model in MODEL_CANDIDATES:
+        try:
+            print(f"[OpenRouter] try {model}")
+            return or_chat_user_only(model, user_text)
+        except Exception as e:
+            last_err = e
+            print(f"[OpenRouter] fail {model} :: {e}")
+            time.sleep(0.8)
+    raise RuntimeError(f"All models failed. Last error: {last_err}")
+
+# ========= Логика =========
+AUTH_HINT = "Авторизация: отправь команду /auth ПАРОЛЬ"
+
+def handle_message(chat_id: int, user_id: int, text: str):
+    global OWNER_ID
+
+    t = (text or "").strip()
+
+    # /myid — всем
+    if t.lower().startswith("/myid"):
+        tg_send_message(chat_id, f"Ваш user_id: {user_id}\nchat_id: {chat_id}")
+        return
+
+    # /start — подсказка
+    if t.lower().startswith("/start"):
+        if OWNER_ID is None:
+            tg_send_message(chat_id, f"Привет! Этот бот ещё не привязан. {AUTH_HINT}")
+        else:
+            if user_id == OWNER_ID:
+                tg_send_message(chat_id, "Привет! Вы авторизованы. Напишите сообщение — отвечу.")
+            else:
+                tg_send_message(chat_id, "Доступ только для владельца этого бота.")
+        return
+
+    # Привязка владельца
+    if OWNER_ID is None:
+        if t.lower().startswith("/auth"):
+            _, _, supplied = t.partition(" ")
+            supplied = supplied.strip()
+            if not supplied:
+                tg_send_message(chat_id, AUTH_HINT)
+                return
+            if supplied == BOT_PASSWORD:
+                OWNER_ID = user_id
+                save_owner_id(OWNER_ID)
+                tg_send_message(chat_id, "Готово. Вы — владелец. Можете писать запросы.")
+            else:
+                tg_send_message(chat_id, "Неверный пароль. Повторите /auth ПАРОЛЬ")
+        elif t == BOT_PASSWORD:
+            OWNER_ID = user_id
+            save_owner_id(OWNER_ID)
+            tg_send_message(chat_id, "Готово. Вы — владелец. Можете писать запросы.")
+        else:
+            tg_send_message(chat_id, f"Требуется авторизация. {AUTH_HINT}")
+        return
+
+    # Владелец установлен — проверяем
+    if user_id != OWNER_ID:
+        tg_send_message(chat_id, "Доступ только для владельца этого бота.")
+        return
+
+    # Владелец пишет обычный текст
+    if not t:
+        tg_send_message(chat_id, "Отправьте текстовое сообщение.")
+        return
+
+    tg_send_action(chat_id, "typing")
+    try:
+        raw_answer = ask_openrouter_plain(t)       # без промтов
+        answer = postprocess_answer(raw_answer)    # нормализация + формат телефонов
+    except Exception as e:
+        tg_send_message(chat_id, f"Ошибка генерации: {str(e)}")
+        return
+
+    for part in chunk_text(answer, 3800):
+        tg_send_message(chat_id, part)
+
+# ========= Главный цикл =========
+def main_loop():
+    offset = None
+    print("[BOT] started; owner_id:", OWNER_ID)
+    while True:
+        try:
+            params = {"timeout": 50, "allowed_updates": json.dumps(["message"])}
+            if offset is not None:
+                params["offset"] = offset
+            r = requests.get(f"{TG_API}/getUpdates", params=params, timeout=70)
+            data = r.json()
+            if not data.get("ok"):
+                print("[getUpdates ERR]", data); time.sleep(2); continue
+
+            for upd in data.get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message")
+                if not msg:
+                    continue
+                chat_id = msg["chat"]["id"]
+                from_user = msg.get("from") or {}
+                user_id = from_user.get("id")
+                text = msg.get("text", "")
+
+                if user_id is None:
+                    continue
+                handle_message(chat_id, user_id, text)
+
+        except Exception as e:
+            print("[LOOP ERR]", e)
+            time.sleep(3)
+
+if __name__ == "__main__":
+    if not BOT_PASSWORD or BOT_PASSWORD == "set-strong-password-here":
+        print("[WARN] Задайте безопасный пароль через env BOT_PASSWORD!")
+    main_loop()
