@@ -1,0 +1,635 @@
+# -*- coding: utf-8 -*-
+"""
+Телеграм-бот: одноразовая авторизация владельца + Supabase (pgvector) + RAG + /логистика
+- /auth ПАРОЛЬ — первый успешный вход закрепляет владельца (is_authorized=TRUE в public.users)
+- Отвечает ТОЛЬКО владельцу
+- Вся переписка логируется в public.messages с эмбеддингами (Nomic, 768D)
+- /поиск <запрос> — находит топ похожих сообщений по косинусу
+- /логистика <запрос> — читает файлы из папки logistics в Supabase Storage и генерирует ответ
+- Ответ генерируется через OpenRouter
+"""
+
+import os
+import re
+import time
+import json
+import hashlib
+import requests
+import psycopg2
+import unicodedata
+import logging
+from datetime import datetime
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from supabase import create_client, Client  # Добавляем Supabase клиент
+
+# ====== Логирование ======
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler(), logging.FileHandler("bot.log")]
+)
+logger = logging.getLogger(__name__)
+
+# ====== Ключи/конфиги (env или дефолт) ======
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8426472430:AAEp2q9b3d2TcL6Zwym-ry6elAfsZmv8Cfk")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "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")
+BOT_PASSWORD = os.getenv("BOT_PASSWORD", "Стартуем")
+NOMIC_API_KEY = os.getenv("NOMIC_API_KEY", "nk-e_8fo6qmJb0Nyv1lmt6FiXUeJMqefJVlKjSHhLowmxw")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://jmrqrdddqxuadgbhkfrc.supabase.co")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "your_supabase_service_role_key_here")  # Замени на твой ключ
+SUPABASE_BUCKET_NAME = os.getenv("SUPABASE_BUCKET_NAME", "documents")
+
+# Nomic Atlas API (эмбеддинги 768D)
+NOMIC_URL = "https://api-atlas.nomic.ai/v1/embedding/text"
+NOMIC_MODEL = "nomic-embed-text-v1.5"
+EMBED_DIM = 768
+
+# OpenRouter чат
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+CHAT_MODEL = "meta-llama/llama-3.1-8b-instruct:free"
+
+# Supabase Postgres (Transaction Pooler)
+PGHOST = os.getenv("PGHOST", "aws-0-ap-northeast-1.pooler.supabase.com")
+PGPORT = int(os.getenv("PGPORT", "6543"))
+PGDATABASE = os.getenv("PGDATABASE", "postgres")
+PGUSER = os.getenv("PGUSER", "postgres.jqdcymhcjdaafaqiirsx")
+PGPASSWORD = os.getenv("PGPASSWORD", "diskoteka1984+-")
+
+TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+# ====== Инициализация Supabase клиента ======
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ====== HTTP Retry ======
+session = requests.Session()
+retries = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+session.mount("https://", HTTPAdapter(max_retries=retries))
+
+# ====== DB ======
+def db_connect():
+    try:
+        conn = psycopg2.connect(
+            host=PGHOST, port=PGPORT, dbname=PGDATABASE,
+            user=PGUSER, password=PGPASSWORD, sslmode="require"
+        )
+        logger.info("Database connected successfully")
+        conn.autocommit = True
+        return conn
+    except Exception as e:
+        logger.error(f"Database connection failed: {e}")
+        raise
+
+DB = db_connect()
+
+def db_exec(sql, params=None, fetch=None):
+    try:
+        with DB.cursor() as cur:
+            cur.execute(sql, params or ())
+            if fetch == "one":
+                return cur.fetchone()
+            if fetch == "all":
+                return cur.fetchall()
+    except Exception as e:
+        logger.error(f"DB exec failed: {sql[:100]}... | Error: {e}")
+        raise
+    return None
+
+def ensure_schema():
+    try:
+        db_exec("CREATE EXTENSION IF NOT EXISTS vector;")
+
+        db_exec("""
+        CREATE TABLE IF NOT EXISTS public.users (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL UNIQUE,
+            username TEXT,
+            password_hash TEXT NOT NULL,
+            is_authorized BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );""")
+        db_exec("CREATE INDEX IF NOT EXISTS idx_users_user_id ON public.users(user_id);")
+
+        row = db_exec("""
+        SELECT column_name FROM information_schema.columns 
+        WHERE table_schema='public' AND table_name='messages' AND column_name='role';
+        """, fetch="one")
+        if not row:
+            logger.warning("Messages table missing or lacks 'role' column, recreating...")
+            db_exec("DROP TABLE IF EXISTS public.messages;")
+            db_exec(f"""
+            CREATE TABLE public.messages (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                username TEXT,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                embedding vector({EMBED_DIM})
+            );""")
+            db_exec("CREATE INDEX IF NOT EXISTS idx_messages_user_id ON public.messages(user_id);")
+            db_exec("""
+            CREATE INDEX IF NOT EXISTS idx_messages_embedding
+            ON public.messages USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+            """)
+        else:
+            try:
+                db_exec(f"ALTER TABLE public.messages ALTER COLUMN embedding TYPE vector({EMBED_DIM});")
+            except Exception as e:
+                logger.warning(f"ALTER embedding failed: {e}")
+    except Exception as e:
+        logger.error(f"Schema setup failed: {e}")
+        raise
+
+ensure_schema()
+
+# ====== Утилиты TG ======
+def tg_send_action(chat_id: int, action: str = "typing"):
+    try:
+        session.post(f"{TG_API}/sendChatAction", json={"chat_id": chat_id, "action": action}, timeout=10)
+    except Exception as e:
+        logger.warning(f"Send action failed: {e}")
+
+def tg_send_message(chat_id: int, text: str):
+    try:
+        r = session.post(f"{TG_API}/sendMessage", json={
+            "chat_id": chat_id, "text": text or "", "disable_web_page_preview": True
+        }, timeout=30)
+        j = r.json()
+        if not j.get("ok"):
+            logger.error(f"TG send failed: {j}")
+        return j
+    except Exception as e:
+        logger.error(f"TG send error: {e}")
+        return {"ok": False, "error": str(e)}
+
+def chunk_text(text: str, max_len: int = 3800):
+    lines = (text or "").splitlines(True)
+    chunks, buf, total = [], [], 0
+    for line in lines:
+        if total + len(line) > max_len and buf:
+            chunks.append("".join(buf)); buf, total = [line], len(line)
+        else:
+            buf.append(line); total += len(line)
+    if buf: chunks.append("".join(buf))
+    return chunks
+
+# ====== Нормализация входа ======
+def normalize_input(s: str) -> str:
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("\u00A0", " ").replace("\u200b", "")
+    return s.strip()
+
+AUTH_RE = re.compile(r'^/auth(?:[\s\u00A0]+|[=:])(.+)$', re.IGNORECASE)
+LOGISTICS_RE = re.compile(r'^/логистика(?:[\s\u00A0]+|[=:])(.+)$', re.IGNORECASE)
+
+# ====== Форматирование ответа ======
+URL_RE = re.compile(r'(https?://[^\s]+)', re.I)
+PHONE_RE = re.compile(r'(?<!\w)(\+\s*\d[\d\-\s\(\)]{7,20}\d)(?!\w)')
+
+def _protect_urls(text: str):
+    urls = []
+    def repl(m):
+        urls.append(m.group(0))
+        return f"__URL{len(urls)-1}__"
+    return URL_RE.sub(repl, text), urls
+
+def _restore_urls(text: str, urls):
+    for i, u in enumerate(urls):
+        text = text.replace(f"__URL{i}__", u)
+    return text
+
+def normalize_plain(text: str) -> str:
+    if not text: return ""
+    t = text.replace("\r\n", "\n")
+    t, urls = _protect_urls(t)
+    t = re.sub(r'^\s*[*-]\s+', '• ', t, flags=re.M)
+    t = re.sub(r'\*\*(.*?)\*\*', r'\1', t)
+    t = re.sub(r'__(.*?)__', r'\1', t)
+    t = re.sub(r'(?<!\*)\*(?!\*)([^*\n]+?)(?<!\*)\*(?!\*)', r'\1', t)
+    t = re.sub(r'^\s{0,3}#{1,6}\s*', '', t, flags=re.M)
+    t = re.sub(r'```(.*?)```', r'\1', t, flags=re.S)
+    t = t.replace('`', '')
+    t = re.sub(r'\n{3,}', '\n\n', t).strip()
+    return _restore_urls(t, urls)
+
+def _digits_only(s: str) -> str:
+    return ''.join(ch for ch in s if ch.isdigit())
+
+def _fmt_groups(digs: str, groups) -> str:
+    pos = 0; out = []
+    for g in groups:
+        if pos >= len(digs): break
+        out.append(digs[pos:pos+g]); pos += g
+    if pos < len(digs): out.append(digs[pos:])
+    return " ".join(out)
+
+def format_phones(text: str) -> str:
+    if not text: return text
+    safe, urls = _protect_urls(text)
+    def repl(m):
+        raw = m.group(1)
+        s = raw.replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
+        if not s.startswith('+'): return raw
+        digs = _digits_only(s)
+        if len(digs) < 8 or len(digs) > 16: return raw
+        if digs.startswith('420') and len(digs) == 12: return f"+420 {_fmt_groups(digs[3:], [3,3,3])}"
+        if digs.startswith('48')  and len(digs) == 11: return f"+48 {_fmt_groups(digs[2:], [3,3,3])}"
+        if digs.startswith('7')   and len(digs) == 11: return f"+7 {_fmt_groups(digs[1:], [3,3,2,2])}"
+        if digs.startswith('380') and len(digs) == 12: return f"+380 {_fmt_groups(digs[3:], [2,3,2,2])}"
+        cc_len = 1
+        if digs.startswith('1'): cc_len = 1
+        elif len(digs) >= 11:   cc_len = 3
+        elif len(digs) >= 10:   cc_len = 2
+        cc = '+' + digs[:cc_len]; rest = digs[cc_len:]
+        groups = []
+        while len(rest) > 3:
+            groups.insert(0, rest[-3:]); rest = rest[:-3]
+        if rest: groups.insert(0, rest)
+        return f"{cc} {' '.join(groups)}"
+    safe = PHONE_RE.sub(repl, safe)
+    return _restore_urls(safe, urls)
+
+def postprocess_answer(text: str) -> str:
+    return format_phones(normalize_plain(text))
+
+# ====== Nomic Embeddings (768D) ======
+def get_embedding_nomic(text: str):
+    headers = {
+        "Authorization": f"Bearer {NOMIC_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {"model": NOMIC_MODEL, "texts": [text]}
+    try:
+        r = session.post(NOMIC_URL, headers=headers, json=payload, timeout=45)
+        r.raise_for_status()
+        data = r.json()
+        vec = data.get("embeddings", [[]])[0]
+        if isinstance(vec, list) and len(vec) == EMBED_DIM:
+            logger.info(f"Successfully retrieved embedding for text: {text[:30]}...")
+            return vec
+        logger.error(f"Nomic unexpected response: {data}")
+        return None
+    except Exception as e:
+        logger.error(f"Nomic API error: {e} | Response: {r.text[:200] if 'r' in locals() else 'no response'}")
+        return None
+
+def _vec_literal(vec):
+    return "[" + ",".join(f"{float(x):.8f}" for x in vec) + "]"
+
+# ====== OpenRouter Chat ======
+def chat_openrouter(messages, temperature=0.6, top_p=0.9, timeout=120) -> str:
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Referer": "https://deepnote.com",
+        "X-Title": "Gorodskoj Assistant (Deepnote)",
+    }
+    payload = {"model": CHAT_MODEL, "messages": messages, "temperature": temperature, "top_p": top_p}
+    try:
+        resp = session.post(OPENROUTER_URL, headers=headers, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.error(f"OpenRouter error: {e}")
+        raise RuntimeError(f"OpenRouter failed: {e}")
+
+# ====== Users/Auth ======
+def sha256(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def db_get_user(user_id: int):
+    return db_exec("SELECT user_id, username, password_hash, is_authorized FROM public.users WHERE user_id=%s",
+                   (user_id,), fetch="one")
+
+def db_upsert_user(user_id: int, username: str, password_hash: str = None, is_authorized: bool = None):
+    row = db_get_user(user_id)
+    if row is None:
+        db_exec("INSERT INTO public.users (user_id, username, password_hash, is_authorized) VALUES (%s,%s,%s,%s)",
+                (user_id, username, password_hash or "", bool(is_authorized)))
+    else:
+        sets, vals = [], []
+        if username is not None: sets.append("username=%s"); vals.append(username)
+        if password_hash is not None: sets.append("password_hash=%s"); vals.append(password_hash)
+        if is_authorized is not None: sets.append("is_authorized=%s"); vals.append(bool(is_authorized))
+        if sets:
+            vals.append(user_id)
+            db_exec(f"UPDATE public.users SET {', '.join(sets)} WHERE user_id=%s", tuple(vals))
+
+def is_owner_authorized(user_id: int) -> bool:
+    row = db_get_user(user_id)
+    return bool(row and row[3])
+
+def has_owner() -> bool:
+    row = db_exec("SELECT 1 FROM public.users WHERE is_authorized=TRUE LIMIT 1", fetch="one")
+    return bool(row)
+
+def authorize_owner(user_id: int, username: str, supplied_password: str) -> bool:
+    if has_owner():
+        logger.info(f"Auth attempt by {user_id} rejected: owner already authorized")
+        return False
+    if supplied_password != BOT_PASSWORD:
+        return False
+    db_upsert_user(user_id, username, password_hash=sha256(BOT_PASSWORD), is_authorized=True)
+    logger.info(f"User {user_id} ({username}) authorized as owner")
+    return True
+
+# ====== Supabase Storage ======
+def read_logistics_files(bucket_name: str, folder: str = "logistics"):
+    try:
+        bucket = supabase.storage.from_(bucket_name)
+        # Получаем список файлов в папке logistics
+        files = bucket.list(path=folder).get('data', [])
+        if not files:
+            logger.warning(f"No files found in {bucket_name}/{folder}")
+            return []
+        
+        contents = []
+        for file in files:
+            file_path = f"{folder}/{file['name']}"
+            try:
+                # Скачиваем файл
+                response = bucket.download(file_path)
+                # Предполагаем, что файлы текстовые (txt, md и т.д.)
+                content = response.decode('utf-8')
+                contents.append((file_path, content))
+                logger.info(f"Read file {file_path} from {bucket_name}")
+            except Exception as e:
+                logger.error(f"Failed to read {file_path}: {e}")
+                continue
+        return contents
+    except Exception as e:
+        logger.error(f"Failed to access {bucket_name}/{folder}: {e}")
+        return []
+
+# ====== Messages / RAG ======
+def save_message(user_id: int, username: str, role: str, content: str, embedding):
+    try:
+        if embedding is None:
+            db_exec("""INSERT INTO public.messages (user_id, username, role, content)
+                       VALUES (%s,%s,%s,%s)""", (user_id, username, role, content))
+        else:
+            v = _vec_literal(embedding)
+            db_exec("""INSERT INTO public.messages (user_id, username, role, content, embedding)
+                       VALUES (%s,%s,%s,%s, %s::vector)""",
+                    (user_id, username, role, content, v))
+        logger.info(f"Saved message from {user_id} ({role}): {content[:30]}...")
+    except Exception as e:
+        logger.error(f"Save message failed: {e}")
+
+def search_similar(user_id: int, query_vec, top_k: int = 8):
+    v = _vec_literal(query_vec)
+    try:
+        rows = db_exec("""
+            SELECT content, role
+            FROM public.messages
+            WHERE user_id=%s AND embedding IS NOT NULL
+            ORDER BY embedding <-> %s::vector
+            LIMIT %s
+        """, (user_id, v, top_k), fetch="all") or []
+        return rows
+    except Exception as e:
+        logger.error(f"Search similar failed: {e}")
+        return []
+
+def recent_messages(user_id: int, limit_n: int = 12):
+    try:
+        rows = db_exec("""
+            SELECT content, role
+            FROM public.messages
+            WHERE user_id=%s
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, (user_id, limit_n), fetch="all") or []
+        rows.reverse()
+        return rows
+    except Exception as e:
+        logger.error(f"Recent messages failed: {e}")
+        return []
+
+def build_context(user_id: int, user_text: str, logistics_files: list = None):
+    try:
+        qvec = get_embedding_nomic(user_text)
+        if not qvec: raise RuntimeError("embed None")
+        sims = search_similar(user_id, qvec, top_k=8)
+        ctx_lines = [f"{role.capitalize()}: {c}" for (c, role) in sims]
+        
+        # Добавляем содержимое файлов из logistics, если есть
+        if logistics_files:
+            for file_path, content in logistics_files:
+                ctx_lines.append(f"File {file_path}: {content[:500]}")  # Ограничиваем длину
+        if not ctx_lines: raise RuntimeError("no context available")
+        logger.info(f"Built RAG context for user {user_id} with {len(ctx_lines)} items")
+        return True, "\n".join(ctx_lines)
+    except Exception as e:
+        logger.warning(f"RAG failed: {e}, falling back to recent messages")
+        last = recent_messages(user_id, 12)
+        ctx_lines = [f"{role.capitalize()}: {c}" for (c, role) in last]
+        if logistics_files:
+            for file_path, content in logistics_files:
+                ctx_lines.append(f"File {file_path}: {content[:500]}")
+        return False, "\n".join(ctx_lines)
+
+def generate_reply_with_context(user_id: int, user_text: str, logistics_files: list = None):
+    _, ctx = build_context(user_id, user_text, logistics_files)
+    msgs = [
+        {"role": "system", "content": "Отвечай кратко и по делу. Используй контекст, особенно данные из файлов логистики, если они релевантны."},
+        {"role": "user", "content": f"Контекст:\n{ctx}\n\nВопрос:\n{user_text}"}
+    ]
+    logger.info(f"Generating reply for user {user_id}: {user_text[:30]}...")
+    return chat_openrouter(msgs)
+
+# ====== Основная логика ======
+def handle_message(chat_id: int, user_id: int, username: str, text: str):
+    t = normalize_input(text or "")
+    logger.info(f"Handling message from {user_id} ({username}): {t[:50]}... | Authorized: {is_owner_authorized(user_id)}")
+
+    # Утилиты
+    if t.lower().startswith("/myid"):
+        logger.info(f"Sending user_id and chat_id to {chat_id}")
+        tg_send_message(chat_id, f"Ваш user_id: {user_id}\nchat_id: {chat_id}")
+        return
+
+    if t.lower().startswith("/start"):
+        if is_owner_authorized(user_id):
+            tg_send_message(chat_id, "Привет! Вы авторизованы. Напишите сообщение или используйте /логистика, /поиск.")
+        else:
+            tg_send_message(chat_id, "Привет! Этот бот закрыт. Для доступа отправьте: /auth ПАРОЛЬ")
+        return
+
+    # Поиск похожего: /поиск запрос
+    if t.lower().startswith("/поиск") or t.lower().startswith("/poisk"):
+        query = t.split(" ", 1)[1].strip() if " " in t else ""
+        if not is_owner_authorized(user_id):
+            tg_send_message(chat_id, "Доступ закрыт. /auth ПАРОЛЬ")
+            return
+        if not query:
+            tg_send_message(chat_id, "Использование: /поиск <запрос>")
+            return
+        tg_send_action(chat_id, "typing")
+        qv = get_embedding_nomic(query)
+        if not qv:
+            tg_send_message(chat_id, "Не удалось получить эмбеддинг запроса.")
+            return
+        sims = search_similar(user_id, qv, top_k=8)
+        if not sims:
+            tg_send_message(chat_id, "Ничего похожего не нашлось.")
+            return
+        lines = [f"{i+1}. {c[:500]}" for i, (c, role) in enumerate(sims)]
+        for part in chunk_text("\n".join(lines), 3800):
+            tg_send_message(chat_id, part)
+        return
+
+    # Логистика: /логистика запрос
+    if t.lower().startswith("/логистика") or t.lower().startswith("/logistics"):
+        query = t.split(" ", 1)[1].strip() if " " in t else ""
+        if not is_owner_authorized(user_id):
+            tg_send_message(chat_id, "Доступ закрыт. /auth ПАРОЛЬ")
+            return
+        if not query:
+            tg_send_message(chat_id, "Использование: /логистика <запрос>")
+            return
+        tg_send_action(chat_id, "typing")
+
+        # Читаем файлы из папки logistics
+        logistics_files = read_logistics_files(SUPABASE_BUCKET_NAME, "logistics")
+        if not logistics_files:
+            tg_send_message(chat_id, "Папка logistics пуста или недоступна.")
+            return
+
+        # Логируем вход (с эмбеддингом)
+        uvec = None
+        try:
+            uvec = get_embedding_nomic(query)
+        except Exception as e:
+            logger.error(f"Embed user message failed: {e}")
+        save_message(user_id, username, "user", query, uvec)
+
+        # Генерация ответа с использованием файлов logistics
+        try:
+            raw = generate_reply_with_context(user_id, query, logistics_files)
+        except Exception as e:
+            tg_send_message(chat_id, f"Ошибка генерации: {str(e)}")
+            return
+
+        ans = postprocess_answer(raw)
+
+        # Логируем ответ (с эмбеддингом)
+        avec = None
+        try:
+            avec = get_embedding_nomic(ans)
+        except Exception as e:
+            logger.error(f"Embed bot response failed: {e}")
+        save_message(user_id, username, "assistant", ans, avec)
+
+        for part in chunk_text(ans, 3800):
+            tg_send_message(chat_id, part)
+        return
+
+    # Авторизация
+    if not is_owner_authorized(user_id):
+        supplied = None
+        m = AUTH_RE.match(t)
+        if m:
+            supplied = m.group(1).strip()
+        elif t == (BOT_PASSWORD or "").strip():
+            supplied = t
+
+        if not supplied:
+            tg_send_message(chat_id, "Авторизация: отправьте /auth ПАРОЛЬ")
+            return
+
+        if authorize_owner(user_id, username, supplied):
+            tg_send_message(chat_id, "Готово. Вы авторизованы. Пишите запросы.")
+        else:
+            tg_send_message(chat_id, "Неверный пароль или владелец уже авторизован.")
+        return
+
+    # Владелец — обычный запрос
+    if not t:
+        tg_send_message(chat_id, "Отправьте текстовое сообщение.")
+        return
+
+    tg_send_action(chat_id, "typing")
+
+    # Логируем вход (с эмбеддингом)
+    uvec = None
+    try:
+        uvec = get_embedding_nomic(t)
+    except Exception as e:
+        logger.error(f"Embed user message failed: {e}")
+    save_message(user_id, username, "user", t, uvec)
+
+    # Генерация ответа
+    try:
+        raw = generate_reply_with_context(user_id, t)
+    except Exception as e:
+        tg_send_message(chat_id, f"Ошибка генерации: {str(e)}")
+        return
+
+    ans = postprocess_answer(raw)
+
+    # Логируем ответ (с эмбеддингом)
+    avec = None
+    try:
+        avec = get_embedding_nomic(ans)
+    except Exception as e:
+        logger.error(f"Embed bot response failed: {e}")
+    save_message(user_id, username, "assistant", ans, avec)
+
+    for part in chunk_text(ans, 3800):
+        tg_send_message(chat_id, part)
+
+# ====== Лонг-поллинг ======
+def main_loop():
+    offset = None
+    logger.info("Bot started. Waiting for updates...")
+    while True:
+        try:
+            params = {"timeout": 50, "allowed_updates": ["message"]}
+            if offset is not None:
+                params["offset"] = offset
+            r = session.get(f"{TG_API}/getUpdates", params=params, timeout=70)
+            logger.info(f"getUpdates response: {r.status_code}")
+            data = r.json()
+            if not data.get("ok"):
+                logger.error(f"getUpdates failed: {data}")
+                time.sleep(2)
+                continue
+
+            for upd in data.get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message")
+                if not msg or "text" not in msg:
+                    continue
+                chat_id = msg["chat"]["id"]
+                from_user = msg.get("from") or {}
+                user_id = from_user.get("id")
+                username = (from_user.get("username") or "").strip()
+                text = msg.get("text", "")
+                if user_id is None:
+                    continue
+
+                try:
+                    db_upsert_user(user_id, username)
+                except Exception as e:
+                    logger.warning(f"Users upsert failed: {e}")
+
+                handle_message(chat_id, user_id, username, text)
+
+        except Exception as e:
+            logger.error(f"Main loop error: {e}")
+            time.sleep(3)
+
+# ====== Точка входа ======
+if __name__ == "__main__":
+    logger.info("Checking environment variables...")
+    if not all([TELEGRAM_BOT_TOKEN, OPENROUTER_API_KEY, BOT_PASSWORD, NOMIC_API_KEY, PGUSER, PGPASSWORD, SUPABASE_URL, SUPABASE_KEY]):
+        logger.error("Missing required env vars: TELEGRAM_BOT_TOKEN, OPENROUTER_API_KEY, BOT_PASSWORD, NOMIC_API_KEY, PGUSER, PGPASSWORD, SUPABASE_URL, SUPABASE_KEY")
+        raise SystemExit(1)
+    logger.info("Starting bot...")
+    main_loop()
